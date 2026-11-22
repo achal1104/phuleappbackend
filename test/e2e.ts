@@ -1,0 +1,260 @@
+import { spawn, execSync } from 'child_process';
+import { io, Socket } from 'socket.io-client';
+
+const PORT = 3111, BASE = `http://localhost:${PORT}`;
+const env = { ...process.env, DATABASE_URL: 'postgres://phule:phule@localhost/phule_test', JWT_SECRET: 'x'.repeat(40), PORT: String(PORT),
+  EMERGENCY_RETRY_MS: '100', ESCALATION_POLL_MS: '500', MIN_ESCALATION_SEC: '1', RATE_LIMIT: '100000', ADMIN_PHONE: '+919999900001', ADMIN_PASSWORD: 'AdminPass#2026' };
+let pass = 0, fail = 0; const failures: string[] = [];
+const ok = (c: any, name: string) => { if (c) { pass++; console.log('  ✓', name); } else { fail++; failures.push(name); console.log('  ✗ FAIL', name); } };
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function api(method: string, path: string, token?: string, body?: any) {
+  const r = await fetch(BASE + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  let j: any = null; try { j = await r.json(); } catch {} return { s: r.status, j };
+}
+const connect = (token: string) => new Promise<Socket>((res, rej) => { const s = io(BASE, { auth: { token }, transports: ['websocket'] }); s.on('ready', () => res(s)); s.on('disconnect', () => {}); setTimeout(() => rej(new Error('socket timeout')), 5000); });
+const waitEvt = (s: Socket, ev: string, ms = 2000) => new Promise<any>((res) => { const t = setTimeout(() => res(null), ms); s.once(ev, (d) => { clearTimeout(t); res(d); }); });
+
+(async () => {
+  execSync('psql "postgres://phule:phule@localhost/phule_test" -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"', { stdio: 'ignore' });
+  execSync('node dist/src/db/migrate.js', { env, stdio: 'ignore' });
+  execSync('node dist/src/db/seed-admin.js', { env, stdio: 'ignore' });
+  const srv = spawn('node', ['dist/src/main.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let logs = ''; srv.stdout.on('data', (d) => (logs += d)); srv.stderr.on('data', (d) => (logs += d));
+  for (let i = 0; i < 60; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await sleep(500); }
+  const sockets: Socket[] = [];
+  try {
+    console.log('\n[1] Auth & registration');
+    const a = await api('POST', '/auth/login', undefined, { identifier: '+919999900001', password: 'AdminPass#2026', deviceId: 'd1' });
+    ok(a.s === 201 && a.j.accessToken, 'super admin logs in'); const AT = a.j.accessToken;
+    ok((await api('POST', '/auth/login', undefined, { identifier: '+919999900001', password: 'wrong' })).s === 401, 'wrong password rejected');
+    ok((await api('GET', '/dashboard')).s === 401, 'no token -> 401');
+    const mk = async (name: string, phone: string, role: string, extra: any = {}) => (await api('POST', '/admin/users', AT, { fullName: name, phone, password: 'Passw0rd!2026', role, ...extra })).j;
+    const core = await mk('Core One', '+919999900010', 'core_team'); const core2 = await mk('Core Two', '+919999900011', 'core_team', { canPublishEmergency: true });
+    const hm = await mk('Hall Mgr A', '+919999900020', 'hall_manager', { hallId: 1 }); const hmB = await mk('Hall Mgr B', '+919999900021', 'hall_manager', { hallId: 2 });
+    const em = await mk('Event Mgr', '+919999900030', 'event_manager'); const v1 = await mk('Vol One', '+919999900041', 'volunteer'); const v2 = await mk('Vol Two', '+919999900042', 'volunteer');
+    const v3 = await mk('Vol Three', '+919999900043', 'volunteer'); const v4 = await mk('Vol Four', '+919999900044', 'volunteer');
+    ok(v1.memberId?.startsWith('PFC-'), 'unique member IDs generated');
+    const reg = await api('POST', '/auth/register', undefined, { fullName: 'New Person', phone: '+919999900050', password: 'Passw0rd!2026' });
+    ok(reg.s === 201 && reg.j.status === 'pending', 'self registration pending');
+    ok((await api('POST', '/auth/login', undefined, { identifier: '+919999900050', password: 'Passw0rd!2026' })).s === 401, 'pending user cannot log in');
+    ok((await api('POST', '/auth/register', undefined, { fullName: 'Dup', phone: '+919999900050', password: 'Passw0rd!2026' })).s === 409, 'duplicate phone -> 409');
+    const pend = (await api('GET', '/admin/users?status=pending', AT)).j; ok(pend.length === 1, 'admin sees pending request');
+    ok((await api('POST', `/admin/users/${pend[0].id}/approve`, AT, { role: 'volunteer', designation: 'Gate Volunteer' })).s === 201, 'admin approves + assigns role');
+    const login = async (p: string) => (await api('POST', '/auth/login', undefined, { identifier: p, password: 'Passw0rd!2026', deviceId: 'dev-' + p })).j;
+    const T: any = {}; for (const [k, p] of Object.entries({ core: '+919999900010', core2: '+919999900011', hm: '+919999900020', hmB: '+919999900021', em: '+919999900030', v1: '+919999900041', v2: '+919999900042', v3: '+919999900043', v4: '+919999900044', newp: '+919999900050' })) T[k] = (await login(p as string)).accessToken;
+    ok(!!T.newp, 'approved user can now log in');
+    const rf = (await login('+919999900041')); const r1 = await api('POST', '/auth/refresh', undefined, { refreshToken: rf.refreshToken });
+    ok(r1.s === 201 && r1.j.refreshToken !== rf.refreshToken, 'refresh token rotates');
+    ok((await api('POST', '/auth/refresh', undefined, { refreshToken: rf.refreshToken })).s === 401, 'reused refresh token rejected');
+
+    console.log('\n[2] Backend RBAC');
+    ok((await api('GET', '/admin/users', T.v1)).s === 403, 'volunteer cannot list admin users');
+    ok((await api('POST', '/events', T.v1, {})).s === 403, 'volunteer cannot create event');
+    ok((await api('POST', '/events', T.em, {})).s === 403, 'event manager cannot create event');
+    const rooms0 = (await api('GET', '/rooms', T.v1)).j; ok(rooms0.some((r: any) => r.type === 'global'), 'volunteer auto-joined global room');
+
+    console.log('\n[3] Event creation -> automatic private room');
+    const days = (await api('GET', '/days', AT)).j; const d1 = days[0].id;
+    const mkEv = async (title: string, h: number, vols: string[], mgr: string, s: string, e: string, tok = AT) => api('POST', '/events', tok, { hallId: h, dayId: d1, title, startTime: s, endTime: e, managerId: mgr, volunteerIds: vols });
+    const ev = await mkEv('Dance Competition', 1, [v1.id, v2.id], em.id, '2026-11-27T10:00:00+05:30', '2026-11-27T11:00:00+05:30');
+    ok(ev.s === 201 && ev.j.roomId, 'event created and room auto-generated');
+    const ev2 = await mkEv('Singing Round', 1, [v3.id], em.id, '2026-11-27T11:30:00+05:30', '2026-11-27T12:30:00+05:30');
+    ok((await api('POST', '/events', T.hmB, { hallId: 1, dayId: d1, title: 'x', startTime: '2026-11-27T10:00:00Z', endTime: '2026-11-27T11:00:00Z' })).s === 403, 'hall manager B cannot create in Hall A');
+    ok((await api('POST', '/events', AT, { hallId: 1, dayId: d1, title: 'bad', startTime: '2026-11-27T12:00:00Z', endTime: '2026-11-27T11:00:00Z' })).s === 400, 'end before start rejected');
+    const roomsOf = async (t: string) => (await api('GET', '/rooms', t)).j;
+    const has = async (t: string, roomId: string) => (await roomsOf(t)).some((r: any) => r.id === roomId);
+    ok(await has(T.v1, ev.j.roomId) && await has(T.v2, ev.j.roomId), 'assigned volunteers see event room');
+    ok(!(await has(T.v3, ev.j.roomId)) && !(await has(T.v4, ev.j.roomId)), 'unassigned volunteers do NOT see event room');
+    ok(await has(T.em, ev.j.roomId) && await has(T.hm, ev.j.roomId) && await has(T.core, ev.j.roomId) && await has(AT, ev.j.roomId), 'manager, hall manager, core, admin are members');
+    ok(!(await has(T.hmB, ev.j.roomId)), 'other hall manager excluded');
+    ok((await api('GET', `/rooms/${ev.j.roomId}/messages`, T.v3)).s === 403, 'unassigned volunteer: history 403 (server-side)');
+    ok((await api('POST', `/rooms/${ev.j.roomId}/messages`, T.v3, { body: 'hi' })).s === 403, 'unassigned volunteer: send 403');
+    ok((await api('GET', `/events/${ev.j.id}`, T.v3)).s === 403, 'unassigned volunteer cannot read event detail');
+    const notes = (await api('GET', '/notifications', T.v1)).j; ok(notes.items.some((n: any) => n.type === 'room_assignment'), 'assignee got room_assignment notification');
+    const hdRooms = (await roomsOf(T.v1)).filter((r: any) => r.type === 'hall_day'); ok(hdRooms.length === 1 && hdRooms[0].name.includes('Hall A'), 'volunteer auto-added to Hall A / day hall room only');
+
+    console.log('\n[4] Real-time chat (Socket.IO)');
+    const s1 = await connect(T.v1), s2 = await connect(T.v2), s3 = await connect(T.v3), sEm = await connect(T.em); sockets.push(s1, s2, s3, sEm);
+    let leaked = false; s3.on('message:new', (m) => { if (m.roomId === ev.j.roomId) leaked = true; });
+    const gotP = waitEvt(s2, 'message:new');
+    const ack = await s1.emitWithAck('message:send', { roomId: ev.j.roomId, body: 'Stage check at 9:45' });
+    const got = await gotP; ok(ack.ok && got?.body === 'Stage check at 9:45', 'message delivered in real time to room member');
+    ok(!leaked, 'non-member socket received nothing');
+    const bad = await s3.emitWithAck('message:send', { roomId: ev.j.roomId, body: 'sneak' }); ok(!bad.ok, 'non-member socket send rejected');
+    const hist = (await api('GET', `/rooms/${ev.j.roomId}/messages`, T.v2)).j; const mid = hist.find((m: any) => m.body === 'Stage check at 9:45');
+    ok(!!mid, 'message persisted in PostgreSQL history'); ok(mid.deliveredCount >= 1, 'delivery receipt recorded for online member');
+    const rdP = waitEvt(s1, 'message:status'); await s2.emitWithAck('room:read', { roomId: ev.j.roomId }); const st = await rdP; ok(st?.status === 'read', 'read receipt broadcast');
+    ok((await api('GET', '/rooms', T.v2)).j.find((r: any) => r.id === ev.j.roomId).unread === 0, 'unread count cleared after read');
+    ok((await api('POST', `/messages/${mid.id}/react`, T.v2, { emoji: '👍' })).s === 201, 'reaction works');
+    ok((await api('POST', `/rooms/${ev.j.roomId}/messages`, T.v2, { body: 'reply', replyTo: mid.id })).j.replyTo === mid.id, 'reply works');
+    ok((await api('POST', `/messages/${mid.id}/pin`, T.v2)).s === 403, 'volunteer cannot pin');
+    ok((await api('POST', `/messages/${mid.id}/pin`, T.em)).s === 201, 'manager can pin');
+    ok((await api('GET', `/rooms/${ev.j.roomId}/search?q=Stage`, T.v1)).j.length === 1, 'message search');
+    const fwd = await api('POST', `/messages/${mid.id}/forward`, T.v1, { roomIds: [rooms0.find((r: any) => r.type === 'global').id] }); ok(fwd.s === 201, 'forward to global room');
+    const fd = new FormData(); fd.append('file', new Blob(['%PDF-1.4 test'], { type: 'application/pdf' }), 'plan.pdf');
+    const up = await (await fetch(BASE + '/uploads', { method: 'POST', headers: { Authorization: 'Bearer ' + T.v1 }, body: fd })).json(); ok(up.kind === 'pdf', 'PDF upload accepted');
+    const fd2 = new FormData(); fd2.append('file', new Blob(['MZ'], { type: 'application/x-msdownload' }), 'evil.exe');
+    ok((await fetch(BASE + '/uploads', { method: 'POST', headers: { Authorization: 'Bearer ' + T.v1 }, body: fd2 })).status === 400, 'executable upload rejected');
+    const am = await api('POST', `/rooms/${ev.j.roomId}/messages`, T.v1, { attachmentKey: up.key }); ok(am.s === 201 && am.j.kind === 'pdf', 'PDF shared in room');
+    ok((await fetch(`${BASE}/files/${up.key}`, { headers: { Authorization: 'Bearer ' + T.v2 } })).status === 200, 'room member can open file');
+    ok((await fetch(`${BASE}/files/${up.key}`, { headers: { Authorization: 'Bearer ' + T.v3 } })).status === 403, 'non-member cannot open file');
+
+    console.log('\n[5] Direct messages & profile privacy');
+    const dm = await api('POST', '/dm', T.v1, { userId: v3.id }); ok(dm.s === 201, 'DM room created');
+    const g = waitEvt(s3, 'message:new'); await s1.emitWithAck('message:send', { roomId: dm.j.roomId, body: 'hello v3' }); ok((await g)?.body === 'hello v3', 'DM delivered live');
+    ok((await api('GET', `/rooms/${dm.j.roomId}/messages`, T.v2)).s === 403, 'third party cannot read DM');
+    ok((await api('GET', `/rooms/${dm.j.roomId}/messages`, AT)).s === 403, 'even super admin cannot read private DMs');
+    const pf = (await api('GET', `/members/${v3.id}`, T.v1)).j; ok(pf.phone === null && pf.contactVisible === false, 'volunteer cannot see other volunteer phone');
+    ok((await api('GET', `/members/${v3.id}`, T.core)).j.phone === '+919999900043', 'core team sees phone');
+    ok(pf.online === true, 'online status shown in profile');
+
+    console.log('\n[6] Assignment change -> immediate access revoke');
+    const rm = waitEvt(s2, 'room:removed');
+    const as = await api('PUT', `/events/${ev.j.id}/assignments`, T.hm, { volunteerIds: [v1.id, v4.id] });
+    ok(as.s === 200 && as.j.removed === 1 && as.j.added === 1, 'hall manager reassigns volunteers (v2 out, v4 in)');
+    ok((await rm)?.roomId === ev.j.roomId, 'removed user told instantly over socket');
+    ok((await api('GET', `/rooms/${ev.j.roomId}/messages`, T.v2)).s === 403, 'removed volunteer: history 403 immediately');
+    ok(!(await has(T.v2, ev.j.roomId)) && (await has(T.v4, ev.j.roomId)), 'removed user loses room, new user gains it');
+    let leak2 = false; s2.on('message:new', (m) => { if (m.roomId === ev.j.roomId) leak2 = true; });
+    await s1.emitWithAck('message:send', { roomId: ev.j.roomId, body: 'after removal' }); await sleep(400); ok(!leak2, 'removed user socket no longer receives room messages');
+    ok((await api('PUT', `/events/${ev.j.id}/assignments`, T.hmB, { volunteerIds: [] })).s === 403, 'other hall manager cannot change assignments');
+
+    console.log('\n[7] Schedule change -> notifications + audit');
+    const upd = await api('PATCH', `/events/${ev.j.id}`, T.hm, { startTime: '2026-11-27T10:30:00+05:30', endTime: '2026-11-27T11:30:00+05:30' });
+    ok(upd.s === 200 && upd.j.notified >= 3, 'timing change notifies event + subsequent-event people');
+    ok((await api('GET', '/notifications', T.v3)).j.items.some((n: any) => n.type === 'event_update'), 'subsequent event volunteer (v3) notified');
+    const logs2 = (await api('GET', '/admin/users/audit/logs', AT)).j; const tl = logs2.find((l: any) => l.action === 'event.timing_change');
+    ok(tl && tl.oldValue && tl.newValue && tl.actor === 'Hall Mgr A', 'audit has old/new values and who changed');
+    const h2 = (await api('GET', `/rooms/${ev.j.roomId}/messages`, T.v1)).j; ok(h2.some((m: any) => m.kind === 'system' && m.body.startsWith('Timing changed')), 'event room shows timing-change system message');
+    ok((await api('POST', `/events/${ev2.j.id}/cancel`, AT, {})).s === 400, 'cancel needs confirmation');
+    ok((await api('PUT', '/events/reorder', AT, { hallId: 1, dayId: d1, orderedIds: [ev2.j.id, ev.j.id] })).s === 200, 'drag&drop reorder saved');
+    ok((await api('GET', `/events?hallId=1&dayId=${d1}`, AT)).j[0].id === ev2.j.id, 'order reflected in schedule');
+    ok((await api('GET', '/events', T.v4)).j.length === 1, 'volunteer schedule shows only assigned events');
+
+    console.log('\n[8] Emergency system');
+    const em1 = { category: 'medical', title: 'Medical help Hall A', description: 'Person fainted near entrance', instructions: 'Clear the path', priority: 'critical', targetType: 'all', escalateAfterSec: 1 };
+    ok((await api('POST', '/emergency', T.v1, em1)).s === 403, 'volunteer cannot publish emergency');
+    ok((await api('POST', '/emergency', T.hm, em1)).s === 403, 'hall manager cannot publish emergency');
+    ok((await api('POST', '/emergency', T.core, em1)).s === 403, 'core member without authorisation flag cannot publish');
+    const evP = waitEvt(s1, 'emergency:new', 3000);
+    const pub = await api('POST', '/emergency', T.core2, em1); ok(pub.s === 201 && pub.j.recipients >= 10, 'authorised core member publishes to all');
+    const rcv = await evP; ok(rcv?.title === 'Medical help Hall A', 'online volunteer received emergency instantly');
+    await sleep(2500);
+    const stt = (await api('GET', `/emergency/${pub.j.id}/status`, AT)).j;
+    const byName = (n: string) => stt.find((x: any) => x.fullName === n);
+    ok(byName('Vol One').state === 'awaiting_acknowledgement', 'online user: delivered, awaiting acknowledgement');
+    ok(byName('Vol Four').state === 'failed' && byName('Vol Four').pushAttempts === 3, 'offline user without push token: failed after 3 retries (reported)');
+    ok((await api('POST', `/emergency/${pub.j.id}/ack`, T.v1)).s === 201, 'volunteer acknowledges');
+    ok((await api('GET', `/emergency/${pub.j.id}/status`, AT)).j.find((x: any) => x.fullName === 'Vol One').state === 'acknowledged', 'status flips to acknowledged');
+    const aN = (await api('GET', '/notifications', T.hm)).j.items; ok(aN.some((n: any) => n.type === 'emergency_escalation'), 'non-acknowledgement escalated to hall manager');
+    ok((await api('GET', '/emergency', T.v1)).j[0].stats === null, 'volunteer sees alert without monitoring stats');
+    const inc = await api('POST', '/incidents', T.v1, { title: 'Broken mic stand', category: 'technical', location: 'Hall A stage' }); ok(inc.s === 201, 'volunteer reports incident');
+    ok((await api('PATCH', `/incidents/${inc.j.id}`, T.hm, { status: 'resolved', resolutionNotes: 'Replaced' })).s === 200, 'hall manager resolves incident');
+    ok((await api('PATCH', `/incidents/${inc.j.id}`, T.v1, { status: 'resolved' })).s === 403, 'volunteer cannot resolve incident');
+
+    console.log('\n[9] Dashboard');
+    const dash = (await api('GET', '/dashboard', AT)).j; ok(dash.stats.totalMembers >= 10 && dash.halls.length === 4, 'super admin dashboard: stats + 4 halls from DB');
+    ok(dash.halls[0].manager === 'Hall Mgr A' && dash.halls[0].volunteerCount >= 2 && dash.halls[0].nextEvent !== undefined, 'hall card has manager/volunteers/next');
+    const dv = (await api('GET', '/dashboard', T.v1)).j; ok(dv.stats === null && dv.halls.length === 0 && dv.myRooms.length >= 2, 'volunteer dashboard is personal only');
+    ok((await api('GET', '/dashboard', T.hm)).j.halls.length === 1, 'hall manager sees only own hall');
+
+    console.log('\n[10] Deactivation kills access');
+    const s4 = await connect(T.v4); sockets.push(s4); const dc = new Promise((r) => s4.on('disconnect', () => r(true)));
+    ok((await api('POST', `/admin/users/${v4.id}/deactivate`, AT)).s === 201, 'admin deactivates member');
+    ok((await api('GET', '/rooms', T.v4)).s === 401, 'old access token stops working immediately');
+    ok((await Promise.race([dc, sleep(1500).then(() => false)])) === true, 'live socket force-disconnected');
+    ok((await api('POST', '/auth/login', undefined, { identifier: '+919999900044', password: 'Passw0rd!2026' })).s === 401, 'deactivated user cannot log in');
+
+    console.log('\n[11] Phase 2 – tasks');
+    const task = await api('POST', '/tasks', T.hm, { title: 'Set up stage mics', hallId: 1, priority: 'high', assigneeIds: [v1.id], deadline: new Date(Date.now() + 3600e3).toISOString() });
+    ok(task.s === 201, 'hall manager creates task');
+    ok((await api('POST', '/tasks', T.hm, { title: 'x', hallId: 2, assigneeIds: [v1.id] })).s === 403, 'hall manager cannot create task in another hall');
+    ok((await api('POST', '/tasks', T.v1, { title: 'x', assigneeIds: [v1.id] })).s === 403, 'volunteer cannot create tasks');
+    ok((await api('GET', '/tasks', T.v1)).j.some((t: any) => t.id === task.j.id), 'assignee sees task');
+    ok(!(await api('GET', '/tasks', T.v2)).j.some((t: any) => t.id === task.j.id), 'unassigned volunteer does not see task');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v2, { status: 'accepted' })).s === 403, 'non-assignee cannot change status');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v1, { status: 'completed', completionNotes: 'x' })).s === 400, 'cannot skip workflow (assigned -> completed)');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v1, { status: 'accepted' })).s === 200, 'assignee accepts');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v1, { status: 'in_progress' })).s === 200, 'assignee starts');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v1, { status: 'completed' })).s === 400, 'completion needs notes');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v1, { status: 'completed', completionNotes: 'Done' })).s === 200, 'assignee completes with notes');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.v1, { status: 'verified' })).s === 403, 'assignee cannot verify own task');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.hmB, { status: 'verified' })).s === 403, 'other hall manager cannot verify');
+    ok((await api('PATCH', `/tasks/${task.j.id}/status`, T.hm, { status: 'verified' })).s === 200, 'hall manager verifies');
+    ok((await api('GET', '/tasks', AT)).j.length >= 1, 'super admin sees tasks across halls');
+
+    console.log('\n[12] Phase 2 – QR attendance');
+    const now = Date.now();
+    const qr = await api('POST', '/attendance/qr', T.hm, { location: 'Hall A Gate', hallId: 1, shift: 'Morning', validFrom: new Date(now - 3600e3).toISOString(), validTo: new Date(now + 3600e3).toISOString() });
+    ok(qr.s === 201 && qr.j.code, 'hall manager creates QR for own hall');
+    ok((await api('POST', '/attendance/qr', T.hm, { location: 'Hall B Gate', hallId: 2, shift: 'Morning', validFrom: new Date(now - 3600e3).toISOString(), validTo: new Date(now + 3600e3).toISOString() })).s === 403, 'hall manager cannot create QR for other hall');
+    ok((await api('POST', '/attendance/qr', T.v1, {})).s === 403, 'volunteer cannot create QR');
+    ok((await api('POST', '/attendance/scan', T.v1, { code: 'bogus' })).s === 403, 'invalid QR rejected');
+    ok((await api('POST', '/attendance/scan', T.v3, { code: qr.j.code })).s === 403, 'volunteer not assigned to hall A cannot check in');
+    const sc1 = await api('POST', '/attendance/scan', T.v1, { code: qr.j.code }); ok(sc1.s === 201 && sc1.j.action === 'check_in', 'assigned volunteer checks in');
+    ok((await api('POST', '/attendance/scan', T.v1, { code: qr.j.code })).s === 400, 'immediate re-scan blocked as duplicate');
+    ok((await api('GET', '/attendance/me', T.v1)).j.length === 1, 'own attendance history');
+    ok((await api('GET', '/attendance', T.v1)).s === 403, 'volunteer cannot list everyone\'s attendance');
+    ok((await api('GET', '/attendance', T.hm)).j.length === 1, 'hall manager sees hall attendance');
+    ok((await api('POST', `/attendance/qr/${qr.j.id}/revoke`, T.hm)).s === 201, 'QR revoked');
+    ok((await api('POST', '/attendance/scan', T.v2, { code: qr.j.code })).s === 403, 'revoked QR rejected');
+
+    console.log('\n[13] Phase 2 – VIP restriction, resources, documents, reports');
+    const vip = await api('POST', '/vip', AT, { kind: 'itinerary', title: 'Arrival 10:00', details: { secret: 'confidential' } });
+    ok(vip.s === 201, 'super admin creates VIP record');
+    ok((await api('POST', '/vip', T.v1, { kind: 'itinerary', title: 'x' })).s === 403, 'volunteer cannot create VIP record');
+    ok((await api('GET', '/vip', T.v1)).j.length === 0, 'volunteer sees no VIP data');
+    ok((await api('POST', `/vip/${vip.j.id}/assign`, AT, { userId: v1.id, duty: 'Escort to green room' })).s === 201, 'assign VIP duty');
+    const vv = (await api('GET', '/vip', T.v1)).j; ok(vv.length === 1 && vv[0].duty && vv[0].details === undefined, 'volunteer sees only own duty, no details');
+    ok(JSON.stringify((await api('GET', '/vip', T.hm)).j).includes('confidential') === false, 'hall manager never sees confidential details');
+    ok(JSON.stringify((await api('GET', '/vip', T.core)).j).includes('confidential'), 'core team sees full VIP');
+    const res = await api('POST', '/resources', AT, { name: 'Wireless Mic', category: 'audio', quantity: 3 }); ok(res.s === 201, 'resource created');
+    ok((await api('POST', '/resources/allocations', T.hm, { resourceId: res.j.id, qty: 2 })).s === 201, 'allocate 2 of 3');
+    ok((await api('POST', '/resources/allocations', T.hm, { resourceId: res.j.id, qty: 2 })).s === 400, 'over-allocation refused');
+    ok((await api('GET', '/resources', T.v1)).s === 403, 'volunteer cannot view equipment');
+    const doc = await api('POST', '/documents', AT, { title: 'Venue map', fileKey: 'k1', category: 'map', minRoleRank: 90 });
+    ok(doc.s === 201 && !(await api('GET', '/documents', T.v1)).j.some((d: any) => d.id === doc.j.id), 'rank-restricted document hidden from volunteers');
+    ok((await api('GET', '/reports/summary', AT)).s === 200, 'report summary (super admin)');
+    ok((await api('GET', '/reports/summary', T.hm)).s === 403, 'hall manager cannot read reports');
+    const pdfRes = await fetch(BASE + '/reports/tasks/export.pdf', { headers: { Authorization: 'Bearer ' + AT } });
+    ok(pdfRes.status === 200 && (await pdfRes.text()).startsWith('%PDF'), 'report exports as real PDF');
+    ok((await api('GET', '/admin/audit?action=task', AT)).j.length > 0 && (await api('GET', '/admin/audit', T.core)).s === 403, 'audit log: super admin only');
+
+    console.log('\n[14] Phase 3 – handover, lost & found, feedback, search, password reset');
+    ok((await api('POST', '/handovers', T.v1, { toUserId: em.id, notes: 'x' })).s === 403, 'volunteer cannot create handover');
+    const ho = await api('POST', '/handovers', T.hm, { toUserId: core.id, notes: 'Mics are in locker 3', checklist: ['Lock stage', { text: 'Return keys', done: true }] });
+    ok(ho.s === 201, 'hall manager creates handover');
+    ok((await api('POST', `/handovers/${ho.j.id}/accept`, T.hmB)).s === 404, 'only recipient can accept');
+    ok((await api('POST', `/handovers/${ho.j.id}/accept`, T.core)).s === 201, 'recipient accepts handover');
+    const lf = await api('POST', '/lost-found', T.v1, { kind: 'found', item: 'Black wallet', location: 'Hall A' }); ok(lf.s === 201, 'volunteer reports found item');
+    ok((await api('PATCH', `/lost-found/${lf.j.id}`, T.v1, { status: 'claimed' })).s === 403, 'volunteer cannot resolve case');
+    ok((await api('PATCH', `/lost-found/${lf.j.id}`, T.hm, { status: 'claimed', claimedByName: 'Owner' })).s === 200, 'manager resolves case');
+    ok((await api('POST', '/feedback', T.v1, { rating: 9 })).s === 400, 'feedback rating validated');
+    ok((await api('POST', '/feedback', T.v1, { rating: 4, category: 'operations', message: 'Good' })).s === 201, 'feedback submitted');
+    ok((await api('GET', '/feedback', T.v1)).s === 403 && (await api('GET', '/feedback/closing-report', AT)).j.totals.members >= 10, 'feedback private; closing report works');
+    const sr = (await api('GET', '/search?q=Dance', T.v1)).j; ok(sr.events.length >= 1 && sr.rooms.length >= 1, 'search finds event and own room');
+    ok((await api('GET', '/search?q=Dance', T.v3)).j.rooms.length === 0, 'search never reveals rooms user is not in');
+    ok((await api('POST', '/auth/forgot', undefined, { identifier: '+919999900042' })).s === 201, 'forgot-password request accepted');
+    ok((await api('POST', '/auth/forgot', undefined, { identifier: '+910000000000' })).s === 201, 'unknown number gets identical response');
+    const rr = (await api('GET', '/admin/reset-requests', AT)).j; ok(rr.length === 1, 'admin sees reset request');
+    const iss = await api('POST', `/admin/reset-requests/${rr[0].id}/issue`, AT);
+    ok(iss.s === 201 && iss.j.temporaryPassword, 'admin issues temporary password');
+    ok((await api('GET', '/rooms', T.v2)).s === 200, 'access token still valid until expiry check (sessions revoked at refresh)');
+    ok((await api('POST', '/auth/login', undefined, { identifier: '+919999900042', password: iss.j.temporaryPassword, deviceId: 'x' })).s === 201, 'member logs in with temporary password');
+    ok((await api('POST', '/auth/login', undefined, { identifier: '+919999900042', password: 'Passw0rd!2026', deviceId: 'x' })).s === 401, 'old password no longer works');
+
+    console.log('\n[15] Contacts directory & announcements');
+    ok((await api('POST', '/emergency-contacts', T.v1, { category: 'medical', name: 'Ambulance', phone: '108' })).s === 403, 'volunteer cannot edit contact directory');
+    const ct = await api('POST', '/emergency-contacts', AT, { category: 'medical', name: 'Ambulance', phone: '108' }); ok(ct.s === 201, 'admin adds emergency contact');
+    ok((await api('POST', '/emergency-contacts', AT, { category: 'medical', name: 'Bad', phone: 'abc' })).s === 400, 'invalid phone rejected');
+    ok((await api('GET', '/emergency-contacts', T.v1)).j.some((c: any) => c.name === 'Ambulance'), 'every member can read emergency contacts');
+    const an = await api('POST', '/announcements', T.hm, { title: 'Hall A briefing', body: 'Be at stage 8:30', pinned: true, hallId: 2 }); ok(an.s === 201, 'hall manager announces');
+    ok((await api('GET', '/announcements', T.v1)).j.some((a: any) => a.title === 'Hall A briefing'), 'hall volunteer sees hall announcement');
+    ok(!(await api('GET', '/announcements', T.v3)).j.some((a: any) => a.title === 'Hall A briefing'), 'volunteer outside the hall does not');
+    ok((await api('POST', '/announcements', T.v1, { title: 'x', body: 'y' })).s === 403, 'volunteer cannot announce');
+    ok((await api('PATCH', `/announcements/${an.j.id}/pin`, T.hm)).s === 403, 'hall manager cannot pin/unpin');
+  } catch (e) { fail++; failures.push('EXCEPTION ' + (e as Error).stack); console.error(e); }
+  finally { sockets.forEach((s) => s.close()); srv.kill(); }
+  console.log(`\n==== ${pass} passed, ${fail} failed ====`); if (fail) { console.log(failures.join('\n')); console.log(logs.slice(-1500)); }
+  process.exit(fail ? 1 : 0);
+})();
