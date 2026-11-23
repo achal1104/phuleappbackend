@@ -56,7 +56,12 @@ export class ChatService {
     if (replyTo && !(await this.db.one('SELECT 1 FROM messages WHERE id=$1 AND room_id=$2', [replyTo, roomId]))) throw new BadRequestException('replyTo not in this room');
     const msg = await this.db.tx(async (c) => {
       const m = (await c.query('INSERT INTO messages(room_id,sender_id,body,kind,reply_to,forwarded_from) VALUES($1,$2,$3,$4,$5,$6) RETURNING *', [roomId, me.id, body, kind, replyTo, d.forwardedFrom ?? null])).rows[0];
-      if (att) await c.query('INSERT INTO message_attachments(message_id,storage_key,file_name,mime_type,size_bytes) VALUES($1,$2,$3,$4,$5)', [m.id, att.key, att.name, att.mime, att.size]);
+      if (att) {
+        let fileBuffer: Buffer | null = null;
+        const fp = path.join(UPLOAD_DIR, path.basename(att.key));
+        if (fs.existsSync(fp)) fileBuffer = fs.readFileSync(fp);
+        await c.query('INSERT INTO message_attachments(message_id,storage_key,file_name,mime_type,size_bytes,data) VALUES($1,$2,$3,$4,$5,$6)', [m.id, att.key, att.name, att.mime, att.size, fileBuffer]);
+      }
       const members = (await c.query('SELECT user_id FROM room_members WHERE room_id=$1 AND removed_at IS NULL AND user_id<>$2', [roomId, me.id])).rows.map((r) => r.user_id);
       await c.query(`INSERT INTO message_receipts(message_id,user_id,delivered_at) SELECT $1,u, CASE WHEN u = ANY($3::uuid[]) THEN now() END FROM unnest($2::uuid[]) u`, [m.id, members, members.filter((u) => this.rt.isOnline(u))]);
       return { m, members };
@@ -216,7 +221,15 @@ export class ChatController {
     return { key, kind: MIME[f.mimetype] };
   }
   @Get('files/:key') async file(@Me() me: AuthUser, @Param('key') key: string, @Res() res: any) {
-    key = path.basename(key); const fp = path.join(UPLOAD_DIR, key); if (!fs.existsSync(fp)) throw new NotFoundException();
+    key = path.basename(key);
+    const att = await this.db.one('SELECT mime_type, file_name, data FROM message_attachments WHERE storage_key=$1 LIMIT 1', [key]);
+    if (att && att.data) {
+      res.setHeader('Content-Type', att.mime_type);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.file_name || 'file')}"`);
+      return res.send(att.data);
+    }
+    const fp = path.join(UPLOAD_DIR, key); if (!fs.existsSync(fp)) throw new NotFoundException();
     let ok = key.startsWith(me.id + '_') || me.role === 'super_admin';
     if (!ok) {
       const roomCheck = await this.db.one(`
