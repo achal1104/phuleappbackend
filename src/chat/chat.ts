@@ -218,12 +218,26 @@ export class ChatController {
   @Get('files/:key') async file(@Me() me: AuthUser, @Param('key') key: string, @Res() res: any) {
     key = path.basename(key); const fp = path.join(UPLOAD_DIR, key); if (!fs.existsSync(fp)) throw new NotFoundException();
     let ok = key.startsWith(me.id + '_') || me.role === 'super_admin';
-    if (!ok) ok = !!(await this.db.one(`SELECT 1 FROM message_attachments a JOIN messages m ON m.id=a.message_id AND m.deleted_at IS NULL
-      JOIN room_members rm ON rm.room_id=m.room_id AND rm.user_id=$2 AND rm.removed_at IS NULL WHERE a.storage_key=$1 LIMIT 1`, [key, me.id]));
+    if (!ok) {
+      const roomCheck = await this.db.one(`
+        SELECT r.type FROM message_attachments a
+        JOIN messages m ON m.id=a.message_id AND m.deleted_at IS NULL
+        JOIN rooms r ON r.id=m.room_id
+        WHERE a.storage_key=$1 LIMIT 1
+      `, [key]);
+      if (roomCheck) {
+        if (['global', 'hall_day', 'event'].includes(roomCheck.type)) {
+          ok = true;
+        } else {
+          ok = !!(await this.db.one(`SELECT 1 FROM message_attachments a JOIN messages m ON m.id=a.message_id AND m.deleted_at IS NULL
+            JOIN room_members rm ON rm.room_id=m.room_id AND rm.user_id=$2 AND rm.removed_at IS NULL WHERE a.storage_key=$1 LIMIT 1`, [key, me.id]));
+        }
+      }
+    }
     if (!ok) throw new ForbiddenException();
     const meta = JSON.parse(fs.readFileSync(fp + '.json', 'utf8'));
     res.setHeader('Content-Type', meta.mime); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(meta.name)}"`);
-    res.sendFile(fp);
+    return res.sendFile(fp);
   }
 }
 
