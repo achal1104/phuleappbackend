@@ -99,4 +99,9 @@ export class AuthController {
     return { ok: true };
   }
   @Get('me') async me(@Me() me: AuthUser) { return this.s.publicUser(await this.db.one('SELECT * FROM users WHERE id=$1', [me.id])); }
+  @Patch('me/photo') async photo(@Me() me: AuthUser, @Body() b: any) {
+    const key = str(b.photoUrl, 'photoUrl', 200);
+    await this.db.q('UPDATE users SET photo_url=$2, updated_at=now() WHERE id=$1', [me.id, key]);
+    return { ok: true, photoUrl: key };
+  }
 }
