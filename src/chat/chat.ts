@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Injectable, NotFoundException, Param, Post, Query, Res, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, ForbiddenException, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ConnectedSocket, MessageBody, OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit, SubscribeMessage, WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
 import { JwtService } from '@nestjs/jwt';
@@ -13,7 +13,7 @@ import { Notifier } from '../notifications/notifications';
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const MIME: Record<string, string> = {
-  'image/jpeg': 'image', 'image/png': 'image', 'image/webp': 'image', 'application/pdf': 'pdf',
+  'image/jpeg': 'image', 'image/jpg': 'image', 'image/png': 'image', 'image/webp': 'image', 'application/pdf': 'pdf',
   'video/mp4': 'video', 'audio/mpeg': 'voice', 'audio/mp4': 'voice', 'audio/aac': 'voice', 'audio/ogg': 'voice', 'audio/webm': 'voice',
   'application/msword': 'document', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'document',
   'application/vnd.ms-excel': 'document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'document', 'text/plain': 'document',
@@ -29,7 +29,13 @@ export class ChatService {
     if (!room) throw new NotFoundException('Room not found');
     const m = await this.db.one('SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2 AND removed_at IS NULL', [roomId, me.id]);
     const adminRead = !write && me.role === 'super_admin' && room.type !== 'direct';
-    if (!m && !adminRead) throw new ForbiddenException('You do not have access to this room');
+    const canRead = !write && (m || room.type === 'event' || room.type === 'global' || room.type === 'hall_day' || adminRead);
+    if (!canRead && !m && !adminRead) throw new ForbiddenException('You do not have access to this room');
+
+    if (write && room.type === 'event' && me.role !== 'super_admin' && me.role !== 'hall_manager' && me.role !== 'core_team') {
+      const assigned = await this.db.one('SELECT 1 FROM event_assignments WHERE event_id=$1 AND user_id=$2', [room.event_id, me.id]);
+      if (!assigned) throw new ForbiddenException('Only assigned team members of this event can send messages in this chat');
+    }
     if (write && room.closed_at) throw new ForbiddenException('Room is closed');
     return room;
   }
@@ -154,10 +160,30 @@ export class ChatController {
     const forwardAtt = att ? { key: att.storage_key, name: att.file_name, mime: att.mime_type, size: att.size_bytes } : undefined;
     const out = []; for (const t of targets) out.push(await this.chat.send(me, t, { body: m.body, forwardedFrom: id, forwardAtt })); return out;
   }
-  @Delete('messages/:id') @Roles('super_admin') async moderate(@Me() me: AuthUser, @Param('id') id: string) {
-    const m = await this.db.one('UPDATE messages SET deleted_at=now() WHERE id=$1 RETURNING room_id', [uuid(id, 'id')]);
-    if (!m) throw new NotFoundException(); await this.audit.log(me.id, 'message.moderate', 'message', id);
-    this.rt.toRoom(m.room_id, 'message:deleted', { messageId: id }); return { ok: true };
+  @Patch('messages/:id') async editMessage(@Me() me: AuthUser, @Param('id') id: string, @Body() b: any) {
+    uuid(id, 'id');
+    const msg = await this.db.one('SELECT * FROM messages WHERE id=$1 AND deleted_at IS NULL', [id]);
+    if (!msg) throw new NotFoundException();
+    await this.chat.access(me, msg.room_id, true);
+    if (msg.sender_id !== me.id && me.role !== 'super_admin') throw new ForbiddenException('You can only edit your own messages');
+    const newBody = str(b.body, 'body', 4000)!;
+    await this.db.q('UPDATE messages SET body=$2, updated_at=now() WHERE id=$1', [id, newBody]);
+    this.rt.toRoom(msg.room_id, 'message:updated', { messageId: id, body: newBody });
+    return { ok: true, body: newBody };
+  }
+
+  @Delete('messages/:id') async deleteMessage(@Me() me: AuthUser, @Param('id') id: string) {
+    uuid(id, 'id');
+    const msg = await this.db.one('SELECT * FROM messages WHERE id=$1 AND deleted_at IS NULL', [id]);
+    if (!msg) throw new NotFoundException();
+    await this.chat.access(me, msg.room_id, true);
+    if (msg.sender_id !== me.id && me.role !== 'super_admin' && me.role !== 'hall_manager' && me.role !== 'core_team') {
+      throw new ForbiddenException('Not authorized to delete this message');
+    }
+    await this.db.q('UPDATE messages SET deleted_at=now() WHERE id=$1', [id]);
+    await this.audit.log(me.id, 'message.delete', 'message', id);
+    this.rt.toRoom(msg.room_id, 'message:deleted', { messageId: id });
+    return { ok: true };
   }
   @Get('admin/reports') @Roles('super_admin') reports() {
     return this.db.rows(`SELECT m.id, m.body, m.reported_count AS "reportedCount", m.room_id AS "roomId", u.full_name AS "senderName" FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.reported_count>0 AND m.deleted_at IS NULL ORDER BY m.reported_count DESC LIMIT 100`);
@@ -180,7 +206,9 @@ export class ChatController {
   // ----- uploads (validated, stored privately, served only to authorised users)
   @Post('uploads') @UseInterceptors(FileInterceptor('file', { storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }))
   async upload(@Me() me: AuthUser, @UploadedFile() f: any) {
-    if (!f) throw new BadRequestException('file required'); if (!MIME[f.mimetype]) throw new BadRequestException('File type not allowed');
+    if (!f) throw new BadRequestException('file required');
+    if (f.mimetype === 'image/jpg') f.mimetype = 'image/jpeg';
+    if (!MIME[f.mimetype]) throw new BadRequestException('File type not allowed');
     const ext = path.extname(f.originalname).toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 8);
     const key = `${me.id}_${crypto.randomUUID()}${ext}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, key), f.buffer);
