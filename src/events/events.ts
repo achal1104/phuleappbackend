@@ -29,10 +29,8 @@ export class EventsController {
     throw new ForbiddenException('Not authorised for this event');
   }
   private async canView(me: AuthUser, eventId: string) {
-    if (me.rank >= 90) return true;
-    const r = await this.db.one(`SELECT 1 FROM events e WHERE e.id=$1 AND e.deleted_at IS NULL AND (
-      ((e.hall_id=$3) AND $2 IN ('hall_manager','management')) OR EXISTS(SELECT 1 FROM event_assignments a WHERE a.event_id=e.id AND a.user_id=$4))`, [eventId, me.role, me.hallId, me.id]);
-    return !!r;
+    const e = await this.db.one('SELECT 1 FROM events WHERE id=$1 AND deleted_at IS NULL', [eventId]);
+    return !!e;
   }
 
   // ---------- reads
@@ -43,9 +41,7 @@ export class EventsController {
         (SELECT r.id FROM rooms r JOIN room_members m ON m.room_id=r.id AND m.user_id=$1 AND m.removed_at IS NULL WHERE r.event_id=e.id) AS "roomId"
       FROM events e JOIN halls h ON h.id=e.hall_id JOIN festival_days d ON d.id=e.day_id
       WHERE e.deleted_at IS NULL AND ($2::int IS NULL OR e.hall_id=$2) AND ($3::int IS NULL OR e.day_id=$3)
-        AND ( $4 IN ('super_admin','core_team') OR (e.hall_id=$5 AND $4 IN ('hall_manager','management'))
-              OR EXISTS(SELECT 1 FROM event_assignments a WHERE a.event_id=e.id AND a.user_id=$1))
-      ORDER BY d.day, e.hall_id, e.seq, e.start_time`, [me.id, hallId ? +hallId : null, dayId ? +dayId : null, me.role, me.hallId]);
+      ORDER BY d.day, e.hall_id, e.seq, e.start_time`, [me.id, hallId ? +hallId : null, dayId ? +dayId : null]);
   }
 
   @Get('events/:id') async get(@Me() me: AuthUser, @Param('id') id: string) {
