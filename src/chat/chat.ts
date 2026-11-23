@@ -96,10 +96,11 @@ export class ChatController {
 
   @Get('rooms') async rooms(@Me() me: AuthUser) {
     const rows = await this.db.rows(`SELECT r.id, r.type, r.name, r.hall_id AS "hallId", r.day_id AS "dayId", r.event_id AS "eventId", r.closed_at AS "closedAt",
-        (SELECT count(*)::int FROM messages m WHERE m.room_id=r.id AND m.created_at > rm.last_read_at AND m.sender_id<>$1 AND m.deleted_at IS NULL) AS unread,
+        (SELECT count(*)::int FROM messages m WHERE m.room_id=r.id AND m.created_at > COALESCE(rm.last_read_at, '2020-01-01'::timestamptz) AND m.sender_id<>$1 AND m.deleted_at IS NULL) AS unread,
         (SELECT json_build_object('body',m.body,'kind',m.kind,'at',m.created_at) FROM messages m WHERE m.room_id=r.id AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 1) AS "lastMessage",
         CASE WHEN r.type='direct' THEN (SELECT u.full_name FROM room_members o JOIN users u ON u.id=o.user_id WHERE o.room_id=r.id AND o.user_id<>$1 LIMIT 1) END AS "peerName"
-      FROM rooms r JOIN room_members rm ON rm.room_id=r.id AND rm.user_id=$1 AND rm.removed_at IS NULL
+      FROM rooms r LEFT JOIN room_members rm ON rm.room_id=r.id AND rm.user_id=$1 AND rm.removed_at IS NULL
+      WHERE r.closed_at IS NULL AND (r.type IN ('global','hall_day','event') OR rm.user_id=$1)
       ORDER BY (r.type='global') DESC, r.type, r.name`, [me.id]);
     return rows.map((r) => ({ ...r, name: r.peerName ?? r.name }));
   }
