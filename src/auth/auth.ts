@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Injectable, Post, Get, UnauthorizedException, ConflictException, Req } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Injectable, Post, Get, Patch, UnauthorizedException, ConflictException, Req } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
