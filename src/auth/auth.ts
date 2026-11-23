@@ -4,6 +4,7 @@ import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
 import { Audit, AuthUser, Db, Me, Public, Realtime, phoneNorm, str } from '../common/core';
+import { Notifier } from '../notifications/notifications';
 
 const sha = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
 const REFRESH_DAYS = Number(process.env.REFRESH_TTL_DAYS || 5);
@@ -11,7 +12,7 @@ const REFRESH_DAYS = Number(process.env.REFRESH_TTL_DAYS || 5);
 @Injectable()
 export class AuthService {
   private fails = new Map<string, { n: number; until: number }>();
-  constructor(private db: Db, private jwt: JwtService, private audit: Audit) {}
+  constructor(private db: Db, private jwt: JwtService, private audit: Audit, private notifier: Notifier) {}
 
   async issue(userId: string, deviceId: string) {
     const access = await this.jwt.signAsync({ sub: userId }, { expiresIn: process.env.ACCESS_TTL || '15m' });
@@ -35,8 +36,18 @@ export class AuthService {
     const hash = await bcrypt.hash(pw, 11);
     try {
       const u = await this.db.one(`INSERT INTO users(member_id,full_name,phone,email,password_hash,status)
-        VALUES('PFC-'||lpad(nextval('member_seq')::text,4,'0'),$1,$2,$3,$4,'pending') RETURNING id, member_id`, [name, phone, email, hash]);
+        VALUES('PFC-'||lpad(nextval('member_seq')::text,4,'0'),$1,$2,$3,$4,'pending') RETURNING id, member_id, full_name`, [name, phone, email, hash]);
       await this.audit.log(u.id, 'member.register', 'user', u.id);
+
+      const admins = (await this.db.rows(`SELECT id FROM users WHERE role_code='super_admin' AND status='active' AND deleted_at IS NULL`)).map((r: any) => r.id);
+      if (admins.length) {
+        this.notifier.send(admins, {
+          type: 'registration_approval',
+          title: 'New member registration approval',
+          body: `${name} has requested access. Tap to review.`,
+          deepLink: '/approvals',
+        }).catch(() => {});
+      }
       return { memberId: u.member_id, status: 'pending', message: 'Registration submitted. You will be notified after admin approval.' };
     } catch (e: any) { if (e.code === '23505') throw new ConflictException('Phone or email already registered'); throw e; }
   }

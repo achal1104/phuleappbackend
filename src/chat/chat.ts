@@ -68,10 +68,14 @@ export class ChatService {
     });
     const out = { id: msg.m.id, roomId, senderId: me.id, senderName: me.name, body, kind, replyTo, createdAt: msg.m.created_at, attachment: att ? { key: att.key, name: att.name, mime: att.mime, size: att.size } : null };
     this.rt.toRoom(roomId, 'message:new', out);
-    // push only to offline members, and only for DMs/event rooms (avoid spamming global room)
-    if (room.type !== 'global') {
-      const offline = msg.members.filter((u) => !this.rt.isOnline(u));
-      this.notifier.send(offline, { type: 'chat_message', title: room.type === 'direct' ? me.name : room.name, body: (body ?? '[attachment]').slice(0, 120), deepLink: `/rooms/${roomId}`, data: { roomId } }).catch(() => {});
+    if (msg.members.length) {
+      this.notifier.send(msg.members, {
+        type: 'chat_message',
+        title: room.type === 'direct' ? me.name : `${room.name} • ${me.name}`,
+        body: (body ?? '[attachment]').slice(0, 120),
+        deepLink: `/chat/${roomId}`,
+        data: { roomId }
+      }).catch(() => {});
     }
     return out;
   }
