@@ -38,17 +38,23 @@ export class EventsController {
     return this.db.rows(`SELECT ${EV},
         (SELECT u.full_name FROM event_assignments a JOIN users u ON u.id=a.user_id WHERE a.event_id=e.id AND a.assignment_role='manager' LIMIT 1) AS "managerName",
         (SELECT count(*)::int FROM event_assignments a WHERE a.event_id=e.id AND a.assignment_role='volunteer') AS "volunteerCount",
-        (SELECT r.id FROM rooms r JOIN room_members m ON m.room_id=r.id AND m.user_id=$1 AND m.removed_at IS NULL WHERE r.event_id=e.id) AS "roomId"
+        (SELECT r.id FROM rooms r WHERE r.event_id=e.id LIMIT 1) AS "roomId"
       FROM events e JOIN halls h ON h.id=e.hall_id JOIN festival_days d ON d.id=e.day_id
-      WHERE e.deleted_at IS NULL AND ($2::int IS NULL OR e.hall_id=$2) AND ($3::int IS NULL OR e.day_id=$3)
-      ORDER BY d.day, e.hall_id, e.seq, e.start_time`, [me.id, hallId ? +hallId : null, dayId ? +dayId : null]);
+      WHERE e.deleted_at IS NULL AND ($1::int IS NULL OR e.hall_id=$1) AND ($2::int IS NULL OR e.day_id=$2)
+      ORDER BY d.day, e.hall_id, e.seq, e.start_time`, [hallId ? +hallId : null, dayId ? +dayId : null]);
   }
 
   @Get('events/:id') async get(@Me() me: AuthUser, @Param('id') id: string) {
     uuid(id, 'id'); if (!(await this.canView(me, id))) throw new ForbiddenException('Not authorised for this event');
     const e = await this.db.one(`SELECT ${EV} FROM events e JOIN halls h ON h.id=e.hall_id JOIN festival_days d ON d.id=e.day_id WHERE e.id=$1`, [id]);
     const people = await this.db.rows(`SELECT u.id, u.full_name AS "fullName", u.member_id AS "memberId", a.assignment_role AS "assignmentRole" FROM event_assignments a JOIN users u ON u.id=a.user_id WHERE a.event_id=$1 ORDER BY a.assignment_role, u.full_name`, [id]);
-    const room = await this.db.one(`SELECT r.id FROM rooms r JOIN room_members m ON m.room_id=r.id AND m.user_id=$2 AND m.removed_at IS NULL WHERE r.event_id=$1`, [id, me.id]);
+    let room = await this.db.one(`SELECT r.id FROM rooms r WHERE r.event_id=$1 LIMIT 1`, [id]);
+    if (!room) {
+      const hall = await this.db.one('SELECT name FROM halls WHERE id=$1', [e.hallId]);
+      const day = await this.db.one('SELECT label FROM festival_days WHERE id=$1', [e.dayId]);
+      room = await this.db.one(`INSERT INTO rooms(type,name,hall_id,day_id,event_id,created_by) VALUES('event',$1,$2,$3,$4,$5) RETURNING id`,
+        [`${hall?.name ?? 'Hall'} → ${day?.label ?? 'Day'} → ${e.title}`, e.hallId, e.dayId, id, me.id]);
+    }
     return { ...e, assignments: people, roomId: room?.id ?? null };
   }
 
