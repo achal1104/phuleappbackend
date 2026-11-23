@@ -226,12 +226,29 @@ export class ChatController {
     if (!MIME[f.mimetype]) throw new BadRequestException('File type not allowed');
     const ext = path.extname(f.originalname).toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 8);
     const key = `${me.id}_${crypto.randomUUID()}${ext}`;
-    fs.writeFileSync(path.join(UPLOAD_DIR, key), f.buffer);
-    fs.writeFileSync(path.join(UPLOAD_DIR, key + '.json'), JSON.stringify({ name: f.originalname.slice(0, 200), mime: f.mimetype, size: f.size }));
+
+    await this.db.q(`INSERT INTO user_uploads(storage_key, file_name, mime_type, size_bytes, data, user_id)
+      VALUES($1, $2, $3, $4, $5, $6) ON CONFLICT (storage_key) DO NOTHING`,
+      [key, f.originalname.slice(0, 200), f.mimetype, f.size, f.buffer, me.id]);
+
+    try {
+      fs.writeFileSync(path.join(UPLOAD_DIR, key), f.buffer);
+      fs.writeFileSync(path.join(UPLOAD_DIR, key + '.json'), JSON.stringify({ name: f.originalname.slice(0, 200), mime: f.mimetype, size: f.size }));
+    } catch (_) {}
+
     return { key, kind: MIME[f.mimetype] };
   }
   @Get('files/:key') async file(@Me() me: AuthUser, @Param('key') key: string, @Res() res: any) {
     key = path.basename(key);
+
+    const up = await this.db.one('SELECT mime_type, file_name, data FROM user_uploads WHERE storage_key=$1 LIMIT 1', [key]);
+    if (up && up.data) {
+      res.setHeader('Content-Type', up.mime_type);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(up.file_name || 'file')}"`);
+      return res.send(up.data);
+    }
+
     const att = await this.db.one('SELECT mime_type, file_name, data FROM message_attachments WHERE storage_key=$1 LIMIT 1', [key]);
     if (att && att.data) {
       res.setHeader('Content-Type', att.mime_type);
@@ -239,6 +256,7 @@ export class ChatController {
       res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.file_name || 'file')}"`);
       return res.send(att.data);
     }
+
     const fp = path.join(UPLOAD_DIR, key); if (!fs.existsSync(fp)) throw new NotFoundException();
     let ok = key.startsWith(me.id + '_') || me.role === 'super_admin';
     if (!ok) {
