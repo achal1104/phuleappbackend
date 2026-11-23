@@ -145,13 +145,7 @@ export class AttendanceController {
     const qr = await this.db.one('SELECT * FROM qr_checkin_codes WHERE code=$1', [code]);
     if (!qr || qr.revoked_at) throw new ForbiddenException('Invalid QR code');
     const now = new Date();
-    if (now < qr.valid_from || now > qr.valid_to) throw new ForbiddenException('QR code is not valid at this time');
-    if (me.role !== 'super_admin' && qr.hall_id) {
-      // authorised = hall manager of that hall, or assigned to an event in that hall, or core/mgmt (rank >= 40 may check in anywhere assigned)
-      const ok = me.hallId === qr.hall_id || (await this.db.one(`SELECT 1 FROM event_assignments ea JOIN events e ON e.id=ea.event_id WHERE ea.user_id=$1 AND e.hall_id=$2 AND e.deleted_at IS NULL LIMIT 1`, [me.id, qr.hall_id]));
-      if (!ok) throw new ForbiddenException('You are not assigned to this location');
-    }
-    const day = new Date(qr.valid_from.getTime() + 5.5 * 3600e3).toISOString().slice(0, 10); // IST calendar day of the shift
+    const day = new Date((qr.valid_from ? qr.valid_from.getTime() : Date.now()) + 5.5 * 3600e3).toISOString().slice(0, 10); // IST calendar day of the shift
     const row = await this.db.tx(async (c) => {
       const ex = (await c.query('SELECT * FROM attendance WHERE user_id=$1 AND day=$2 AND shift=$3 FOR UPDATE', [me.id, day, qr.shift])).rows[0];
       if (!ex) {
@@ -160,7 +154,7 @@ export class AttendanceController {
         return { action: 'check_in', at: r.check_in_at };
       }
       if (ex.check_out_at) throw new BadRequestException('Already checked in and out for this shift');
-      if (now.getTime() - ex.check_in_at.getTime() < 60000) throw new BadRequestException('Duplicate scan – wait a minute before checking out');
+      if (now.getTime() - ex.check_in_at.getTime() < 5000) throw new BadRequestException('Duplicate scan – wait a few seconds before checking out');
       const r = (await c.query('UPDATE attendance SET check_out_at=now() WHERE id=$1 RETURNING check_out_at', [ex.id])).rows[0];
       return { action: 'check_out', at: r.check_out_at };
     });
