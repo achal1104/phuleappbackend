@@ -7,7 +7,7 @@ import { Audit, AuthUser, Db, Me, Public, Realtime, phoneNorm, str } from '../co
 import { Notifier } from '../notifications/notifications';
 
 const sha = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
-const REFRESH_DAYS = Number(process.env.REFRESH_TTL_DAYS || 5);
+const REFRESH_DAYS = Number(process.env.REFRESH_TTL_DAYS || 365);
 
 @Injectable()
 export class AuthService {
