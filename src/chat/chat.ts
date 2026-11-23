@@ -95,6 +95,11 @@ export class ChatController {
   constructor(private db: Db, private chat: ChatService, private rt: Realtime, private audit: Audit) {}
 
   @Get('rooms') async rooms(@Me() me: AuthUser) {
+    await this.db.q(`INSERT INTO rooms(type, name, hall_id, day_id)
+      SELECT 'hall_day', h.name || ' → ' || d.label, h.id, d.id
+      FROM halls h CROSS JOIN festival_days d
+      WHERE h.deleted_at IS NULL ON CONFLICT DO NOTHING`);
+
     const rows = await this.db.rows(`SELECT r.id, r.type, r.name, r.hall_id AS "hallId", r.day_id AS "dayId", r.event_id AS "eventId", r.closed_at AS "closedAt",
         (SELECT count(*)::int FROM messages m WHERE m.room_id=r.id AND m.created_at > COALESCE(rm.last_read_at, '2020-01-01'::timestamptz) AND m.sender_id<>$1 AND m.deleted_at IS NULL) AS unread,
         (SELECT json_build_object('body',m.body,'kind',m.kind,'at',m.created_at) FROM messages m WHERE m.room_id=r.id AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 1) AS "lastMessage",
